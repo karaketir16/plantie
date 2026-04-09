@@ -7,7 +7,7 @@ void main() {
     await tester.pumpWidget(const PlantieApp());
 
     expect(find.text('Plantie Monitor'), findsOneWidget);
-    expect(find.text('Saved Pairings'), findsOneWidget);
+    expect(find.text('Saved Devices'), findsOneWidget);
     expect(find.text('Discovered Nearby Devices'), findsOneWidget);
   });
 }

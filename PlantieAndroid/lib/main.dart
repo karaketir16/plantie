@@ -27,6 +27,8 @@ const String monitorChannelName = 'Plantie Monitor';
 const Object _unset = Object();
 const int reminderDurationMinutes = 1;
 const int foregroundServiceNotificationId = 7001;
+const Duration backgroundRefreshInterval = Duration(seconds: 5);
+const Duration connectedGracePeriod = Duration(seconds: 15);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -97,16 +99,25 @@ Future<bool> _unsupportedIosBackground(ServiceInstance service) async => true;
 Future<void> notificationTapBackground(NotificationResponse response) async {
   WidgetsFlutterBinding.ensureInitialized();
   DartPluginRegistrant.ensureInitialized();
-  final payload = response.payload;
+  final devices = await loadStoredDevices();
+  final payload = _resolveNotificationDeviceId(
+    devices,
+    payload: response.payload,
+    notificationId: response.id,
+  );
   if (payload == null) {
     return;
   }
 
-  final devices = await loadStoredDevices();
   final current = devices[payload];
   if (current == null) {
     return;
   }
+
+  final notifications = FlutterLocalNotificationsPlugin();
+  const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const settings = InitializationSettings(android: androidSettings);
+  await notifications.initialize(settings);
 
   PlantieDeviceState updated = current;
   if (response.actionId == alertSnoozeActionId) {
@@ -128,6 +139,7 @@ Future<void> notificationTapBackground(NotificationResponse response) async {
   }
 
   devices[payload] = updated;
+  await notifications.cancel(response.id ?? _thirstNotificationIdFor(payload));
   await saveStoredDevices(devices);
 }
 
@@ -205,6 +217,7 @@ class PlantieBackgroundMonitor {
 
     service.on('refresh-config').listen((_) async {
       await _reloadConfigs();
+      await _reconcileNotifications();
       await _refreshForegroundNotification();
     });
 
@@ -213,8 +226,9 @@ class PlantieBackgroundMonitor {
     });
 
     _refreshTimer?.cancel();
-    _refreshTimer = Timer.periodic(const Duration(seconds: 20), (_) async {
+    _refreshTimer = Timer.periodic(backgroundRefreshInterval, (_) async {
       await _reloadConfigs();
+      await _reconcileNotifications();
       await _refreshForegroundNotification();
     });
   }
@@ -254,6 +268,7 @@ class PlantieBackgroundMonitor {
     for (final id in _devices.keys) {
       await _ensureConnected(id);
     }
+    await _reconcileNotifications();
     _broadcastSnapshot();
   }
 
@@ -392,19 +407,39 @@ class PlantieBackgroundMonitor {
         next.snoozedUntil != null && !next.snoozedUntil!.isAfter(now);
 
     if (snoozeExpired) {
-      next = next.copyWith(snoozedUntil: null);
+      next = next.copyWith(
+        snoozedUntil: null,
+        thirstDismissed: false,
+        hasCrossedDryReset: true,
+      );
     }
 
     if (moisture > next.wetThreshold + 5) {
       next = next.copyWith(hasCrossedWetReset: true);
     }
 
+    if (moisture <= next.dryThreshold - 5) {
+      if (next.thirstAlertActive ||
+          next.thirstDismissed ||
+          next.snoozedUntil != null) {
+        await _notifications.cancel(_thirstNotificationIdFor(next.id));
+      }
+      next = next.copyWith(
+        thirstAlertActive: false,
+        thirstDismissed: false,
+        snoozedUntil: null,
+        hasCrossedDryReset: true,
+      );
+    }
+
     if (moisture > next.dryThreshold) {
       if (!next.thirstDismissed &&
           next.snoozedUntil == null &&
-          !next.thirstAlertActive) {
+          !next.thirstAlertActive &&
+          next.hasCrossedDryReset) {
         next = next.copyWith(
           thirstAlertActive: true,
+          hasCrossedDryReset: false,
           hasTriggeredDryAlert: true,
         );
         await _showThirstyNotification(next);
@@ -419,11 +454,20 @@ class PlantieBackgroundMonitor {
         thirstDismissed: false,
         snoozedUntil: null,
         hasCrossedWetReset: false,
+        hasCrossedDryReset: true,
         hasTriggeredDryAlert: false,
       );
     }
 
     return next;
+  }
+
+  Future<void> _reconcileNotifications() async {
+    for (final device in _devices.values) {
+      if (!device.thirstAlertActive) {
+        await _notifications.cancel(_thirstNotificationIdFor(device.id));
+      }
+    }
   }
 
   void _broadcastSnapshot() {
@@ -502,6 +546,27 @@ class PlantieBackgroundMonitor {
 int _thirstNotificationIdFor(String id) => id.hashCode & 0x7fffffff;
 int _thanksNotificationIdFor(String id) =>
     (id.hashCode & 0x7fffffff) ^ 0x2fffffff;
+
+String? _resolveNotificationDeviceId(
+  Map<String, PlantieDeviceState> devices, {
+  String? payload,
+  int? notificationId,
+}) {
+  if (payload != null && devices.containsKey(payload)) {
+    return payload;
+  }
+  if (notificationId == null) {
+    return null;
+  }
+
+  for (final id in devices.keys) {
+    if (_thirstNotificationIdFor(id) == notificationId ||
+        _thanksNotificationIdFor(id) == notificationId) {
+      return id;
+    }
+  }
+  return null;
+}
 
 class PlantieApp extends StatelessWidget {
   const PlantieApp({super.key});
@@ -589,7 +654,11 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   Future<void> _handleNotificationResponse(
     NotificationResponse response,
   ) async {
-    final deviceId = response.payload;
+    final deviceId = _resolveNotificationDeviceId(
+      _savedDevices,
+      payload: response.payload,
+      notificationId: response.id,
+    );
     if (deviceId == null || !_savedDevices.containsKey(deviceId)) {
       return;
     }
@@ -1002,12 +1071,12 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
             onScanPressed: _startScan,
           ),
           const SizedBox(height: 16),
-          Text('Saved Pairings', style: Theme.of(context).textTheme.titleLarge),
+          Text('Saved Devices', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 8),
           if (savedDevices.isEmpty)
             const _EmptyState(
               message:
-                  'No saved Plantie sensors yet. Scan first, then tap Save on a device.',
+                  'No saved Plantie sensors yet. Scan first, then tap a nearby Plantie to add it.',
             ),
           for (final device in savedDevices)
             _SavedDeviceCard(
@@ -1031,8 +1100,7 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
             _DiscoveryCard(
               result: result,
               isSaved: _savedDevices.containsKey(result.device.remoteId.str),
-              onToggleSaved: () => _toggleSaved(result.device),
-              onConnect: () => _toggleSaved(result.device),
+              onTap: () => _toggleSaved(result.device),
             ),
           const SizedBox(height: 24),
           Text(
@@ -1074,6 +1142,7 @@ class PlantieDeviceState {
     this.thirstAlertActive = false,
     this.thirstDismissed = false,
     this.hasCrossedWetReset = false,
+    this.hasCrossedDryReset = true,
     this.hasTriggeredDryAlert = false,
     this.snoozedUntil,
   });
@@ -1088,6 +1157,7 @@ class PlantieDeviceState {
       thirstAlertActive: map['thirstAlertActive'] as bool? ?? false,
       thirstDismissed: map['thirstDismissed'] as bool? ?? false,
       hasCrossedWetReset: map['hasCrossedWetReset'] as bool? ?? false,
+      hasCrossedDryReset: map['hasCrossedDryReset'] as bool? ?? true,
       hasTriggeredDryAlert: map['hasTriggeredDryAlert'] as bool? ?? false,
       snoozedUntil: map['snoozedUntilMs'] == null
           ? null
@@ -1114,6 +1184,7 @@ class PlantieDeviceState {
   final bool thirstAlertActive;
   final bool thirstDismissed;
   final bool hasCrossedWetReset;
+  final bool hasCrossedDryReset;
   final bool hasTriggeredDryAlert;
   final DateTime? snoozedUntil;
 
@@ -1141,6 +1212,19 @@ class PlantieDeviceState {
 
   bool get showAlertActions => thirstAlertActive;
 
+  bool get seemsConnected {
+    if (isConnected) {
+      return true;
+    }
+
+    final updated = lastUpdated;
+    if (updated == null) {
+      return false;
+    }
+
+    return DateTime.now().difference(updated) <= connectedGracePeriod;
+  }
+
   Map<String, dynamic> toStorage() {
     return <String, dynamic>{
       'alias': alias,
@@ -1150,6 +1234,7 @@ class PlantieDeviceState {
       'thirstAlertActive': thirstAlertActive,
       'thirstDismissed': thirstDismissed,
       'hasCrossedWetReset': hasCrossedWetReset,
+      'hasCrossedDryReset': hasCrossedDryReset,
       'hasTriggeredDryAlert': hasTriggeredDryAlert,
       'snoozedUntilMs': snoozedUntil?.millisecondsSinceEpoch,
     };
@@ -1173,6 +1258,7 @@ class PlantieDeviceState {
       'thirstAlertActive': thirstAlertActive,
       'thirstDismissed': thirstDismissed,
       'hasCrossedWetReset': hasCrossedWetReset,
+      'hasCrossedDryReset': hasCrossedDryReset,
       'hasTriggeredDryAlert': hasTriggeredDryAlert,
       'snoozedUntilMs': snoozedUntil?.millisecondsSinceEpoch,
     };
@@ -1200,6 +1286,8 @@ class PlantieDeviceState {
       thirstDismissed: map['thirstDismissed'] as bool? ?? thirstDismissed,
       hasCrossedWetReset:
           map['hasCrossedWetReset'] as bool? ?? hasCrossedWetReset,
+      hasCrossedDryReset:
+          map['hasCrossedDryReset'] as bool? ?? hasCrossedDryReset,
       hasTriggeredDryAlert:
           map['hasTriggeredDryAlert'] as bool? ?? hasTriggeredDryAlert,
       snoozedUntil: map['snoozedUntilMs'] == null
@@ -1227,6 +1315,7 @@ class PlantieDeviceState {
     bool? thirstAlertActive,
     bool? thirstDismissed,
     bool? hasCrossedWetReset,
+    bool? hasCrossedDryReset,
     bool? hasTriggeredDryAlert,
     Object? snoozedUntil = _unset,
   }) {
@@ -1248,6 +1337,7 @@ class PlantieDeviceState {
       thirstAlertActive: thirstAlertActive ?? this.thirstAlertActive,
       thirstDismissed: thirstDismissed ?? this.thirstDismissed,
       hasCrossedWetReset: hasCrossedWetReset ?? this.hasCrossedWetReset,
+      hasCrossedDryReset: hasCrossedDryReset ?? this.hasCrossedDryReset,
       hasTriggeredDryAlert: hasTriggeredDryAlert ?? this.hasTriggeredDryAlert,
       snoozedUntil: identical(snoozedUntil, _unset)
           ? this.snoozedUntil
@@ -1351,7 +1441,7 @@ class _SavedDeviceCard extends StatelessWidget {
               children: [
                 Chip(
                   label: Text(
-                    device.isConnected
+                    device.seemsConnected
                         ? 'Connected'
                         : device.isNearby
                         ? 'Nearby'
@@ -1390,23 +1480,13 @@ class _SavedDeviceCard extends StatelessWidget {
               spacing: 8,
               runSpacing: 8,
               children: [
-                FilledButton.tonal(
-                  onPressed: null,
-                  child: Text(
-                    device.isConnecting
-                        ? 'Connecting automatically...'
-                        : device.isConnected
-                        ? 'Connected automatically'
-                        : 'Waiting to reconnect',
-                  ),
-                ),
                 OutlinedButton(
                   onPressed: onEditSettings,
                   child: const Text('Alias & Thresholds'),
                 ),
                 OutlinedButton(
-                  onPressed: device.device == null ? null : onRemove,
-                  child: const Text('Remove Pairing'),
+                  onPressed: onRemove,
+                  child: const Text('Remove Device'),
                 ),
               ],
             ),
@@ -1438,14 +1518,12 @@ class _DiscoveryCard extends StatelessWidget {
   const _DiscoveryCard({
     required this.result,
     required this.isSaved,
-    required this.onToggleSaved,
-    required this.onConnect,
+    required this.onTap,
   });
 
   final ScanResult result;
   final bool isSaved;
-  final VoidCallback onToggleSaved;
-  final VoidCallback onConnect;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -1456,19 +1534,19 @@ class _DiscoveryCard extends StatelessWidget {
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       child: ListTile(
+        onTap: isSaved ? null : onTap,
         contentPadding: const EdgeInsets.all(16),
         title: Text(name.isEmpty ? result.device.remoteId.str : name),
-        subtitle: Text('${result.device.remoteId.str}\nRSSI ${result.rssi}'),
+        subtitle: Text(
+          '${result.device.remoteId.str}\nRSSI ${result.rssi}\n'
+          '${isSaved ? 'Already saved' : 'Tap to add this sensor'}',
+        ),
         isThreeLine: true,
-        trailing: Wrap(
-          spacing: 8,
-          children: [
-            OutlinedButton(
-              onPressed: onToggleSaved,
-              child: Text(isSaved ? 'Saved' : 'Save'),
-            ),
-            FilledButton(onPressed: onConnect, child: const Text('Pair')),
-          ],
+        trailing: Icon(
+          isSaved ? Icons.check_circle : Icons.add_circle_outline,
+          color: isSaved
+              ? Theme.of(context).colorScheme.primary
+              : Theme.of(context).colorScheme.secondary,
         ),
       ),
     );
