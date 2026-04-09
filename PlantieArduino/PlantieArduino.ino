@@ -6,7 +6,7 @@
 
 namespace {
 constexpr uint8_t kAnalogPin = 0;
-constexpr unsigned long kNotifyIntervalMs = 500;
+constexpr unsigned long kNotifyIntervalMs = 5 * 1000;
 const char* kServiceUuid = "12345678-1234-5678-1234-56789abc0000";
 const char* kReadingCharacteristicUuid = "12345678-1234-5678-1234-56789abc0001";
 
