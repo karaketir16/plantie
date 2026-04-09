@@ -36,6 +36,7 @@ dependencies:
   shared_preferences: ^2.3.2
   device_info_plus: ^11.1.0
   flutter_local_notifications: ^17.2.3
+  flutter_background_service: ^5.1.0
 
 dev_dependencies:
   flutter_test:

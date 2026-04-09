@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -20,13 +22,486 @@ const String alertChannelId = 'plantie_alerts';
 const String alertChannelName = 'Plantie Alerts';
 const String alertSnoozeActionId = 'snooze_1h';
 const String alertDismissActionId = 'dismiss_alert';
+const String monitorChannelId = 'plantie_monitor';
+const String monitorChannelName = 'Plantie Monitor';
 const Object _unset = Object();
 const int reminderDurationMinutes = 1;
+const int foregroundServiceNotificationId = 7001;
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await initializeBackgroundMonitoring();
   runApp(const PlantieApp());
 }
+
+Future<void> initializeBackgroundMonitoring() async {
+  final notifications = FlutterLocalNotificationsPlugin();
+
+  const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const settings = InitializationSettings(android: androidSettings);
+
+  await notifications.initialize(
+    settings,
+    onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
+  );
+
+  final androidPlugin = notifications
+      .resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin
+      >();
+
+  await androidPlugin?.createNotificationChannel(
+    const AndroidNotificationChannel(
+      alertChannelId,
+      alertChannelName,
+      description:
+          'Watering reminders and recovery messages for Plantie sensors',
+      importance: Importance.high,
+    ),
+  );
+
+  await androidPlugin?.createNotificationChannel(
+    const AndroidNotificationChannel(
+      monitorChannelId,
+      monitorChannelName,
+      description: 'Foreground service for background plant monitoring',
+      importance: Importance.low,
+    ),
+  );
+
+  final service = FlutterBackgroundService();
+  await service.configure(
+    iosConfiguration: IosConfiguration(
+      autoStart: false,
+      onForeground: backgroundMonitoringStart,
+      onBackground: _unsupportedIosBackground,
+    ),
+    androidConfiguration: AndroidConfiguration(
+      onStart: backgroundMonitoringStart,
+      autoStart: false,
+      autoStartOnBoot: true,
+      isForegroundMode: true,
+      notificationChannelId: monitorChannelId,
+      initialNotificationTitle: 'Plantie monitoring',
+      initialNotificationContent: 'Preparing plant monitors',
+      foregroundServiceNotificationId: foregroundServiceNotificationId,
+      foregroundServiceTypes: const [AndroidForegroundType.connectedDevice],
+    ),
+  );
+}
+
+@pragma('vm:entry-point')
+Future<bool> _unsupportedIosBackground(ServiceInstance service) async => true;
+
+@pragma('vm:entry-point')
+Future<void> notificationTapBackground(NotificationResponse response) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
+  final payload = response.payload;
+  if (payload == null) {
+    return;
+  }
+
+  final devices = await loadStoredDevices();
+  final current = devices[payload];
+  if (current == null) {
+    return;
+  }
+
+  PlantieDeviceState updated = current;
+  if (response.actionId == alertSnoozeActionId) {
+    updated = current.copyWith(
+      thirstAlertActive: false,
+      thirstDismissed: false,
+      snoozedUntil: DateTime.now().add(
+        const Duration(minutes: reminderDurationMinutes),
+      ),
+    );
+  } else if (response.actionId == alertDismissActionId) {
+    updated = current.copyWith(
+      thirstAlertActive: false,
+      thirstDismissed: true,
+      snoozedUntil: null,
+    );
+  } else {
+    return;
+  }
+
+  devices[payload] = updated;
+  await saveStoredDevices(devices);
+}
+
+@pragma('vm:entry-point')
+Future<void> backgroundMonitoringStart(ServiceInstance service) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
+
+  final monitor = PlantieBackgroundMonitor(service);
+  await monitor.start();
+}
+
+Future<Map<String, PlantieDeviceState>> loadStoredDevices() async {
+  final prefs = await SharedPreferences.getInstance();
+  final savedIds = prefs.getStringList(pairedDevicesKey) ?? <String>[];
+  final rawConfig = prefs.getString(deviceConfigsKey);
+  final decodedConfig = rawConfig == null
+      ? <String, dynamic>{}
+      : jsonDecode(rawConfig) as Map<String, dynamic>;
+
+  final devices = <String, PlantieDeviceState>{};
+  for (final id in savedIds) {
+    final config = decodedConfig[id];
+    devices[id] = PlantieDeviceState.fromStorage(
+      id,
+      config is Map<String, dynamic> ? config : <String, dynamic>{},
+    );
+  }
+  return devices;
+}
+
+Future<void> saveStoredDevices(Map<String, PlantieDeviceState> devices) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setStringList(pairedDevicesKey, devices.keys.toList()..sort());
+  final configs = <String, Map<String, dynamic>>{};
+  for (final entry in devices.entries) {
+    configs[entry.key] = entry.value.toStorage();
+  }
+  await prefs.setString(deviceConfigsKey, jsonEncode(configs));
+}
+
+int mapRawReadingToMoisture(int rawReading) =>
+    ((rawReading / 4095) * 100).round().clamp(0, 100);
+
+class PlantieBackgroundMonitor {
+  PlantieBackgroundMonitor(this.service);
+
+  final ServiceInstance service;
+  final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
+  final Map<String, PlantieDeviceState> _devices = {};
+  final Map<String, BluetoothDevice> _btDevices = {};
+  final Map<String, StreamSubscription<BluetoothConnectionState>>
+  _connectionSubscriptions = {};
+  final Map<String, StreamSubscription<List<int>>> _valueSubscriptions = {};
+  final Set<String> _settingUpIds = <String>{};
+  Timer? _refreshTimer;
+
+  Future<void> start() async {
+    const androidSettings = AndroidInitializationSettings(
+      '@mipmap/ic_launcher',
+    );
+    const settings = InitializationSettings(android: androidSettings);
+    await _notifications.initialize(
+      settings,
+      onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
+    );
+
+    if (service is AndroidServiceInstance) {
+      await (service as AndroidServiceInstance).setAsForegroundService();
+    }
+
+    await _reloadConfigs();
+    await _refreshForegroundNotification();
+
+    service.on('refresh-config').listen((_) async {
+      await _reloadConfigs();
+      await _refreshForegroundNotification();
+    });
+
+    service.on('stopService').listen((_) async {
+      await stop();
+    });
+
+    _refreshTimer?.cancel();
+    _refreshTimer = Timer.periodic(const Duration(seconds: 20), (_) async {
+      await _reloadConfigs();
+      await _refreshForegroundNotification();
+    });
+  }
+
+  Future<void> stop() async {
+    _refreshTimer?.cancel();
+    for (final sub in _connectionSubscriptions.values) {
+      await sub.cancel();
+    }
+    for (final sub in _valueSubscriptions.values) {
+      await sub.cancel();
+    }
+    await service.stopSelf();
+  }
+
+  Future<void> _reloadConfigs() async {
+    final latest = await loadStoredDevices();
+
+    final removedIds = _devices.keys.toSet().difference(latest.keys.toSet());
+    for (final id in removedIds) {
+      await _connectionSubscriptions.remove(id)?.cancel();
+      await _valueSubscriptions.remove(id)?.cancel();
+      _btDevices.remove(id);
+      await _notifications.cancel(_thirstNotificationIdFor(id));
+      await _notifications.cancel(_thanksNotificationIdFor(id));
+    }
+
+    _devices
+      ..clear()
+      ..addAll(latest);
+
+    if (_devices.isEmpty) {
+      await stop();
+      return;
+    }
+
+    for (final id in _devices.keys) {
+      await _ensureConnected(id);
+    }
+    _broadcastSnapshot();
+  }
+
+  Future<void> _ensureConnected(String id) async {
+    final device = _btDevices.putIfAbsent(id, () => BluetoothDevice.fromId(id));
+    final current = _devices[id];
+    if (current != null) {
+      _devices[id] = current.copyWith(isConnecting: true, error: null);
+    }
+    _broadcastSnapshot();
+
+    _connectionSubscriptions[id] ??= device.connectionState.listen((
+      state,
+    ) async {
+      final current = _devices[id];
+      if (current != null) {
+        _devices[id] = current.copyWith(
+          isConnected: state == BluetoothConnectionState.connected,
+          isConnecting: false,
+          error: state == BluetoothConnectionState.disconnected
+              ? null
+              : current.error,
+        );
+        _broadcastSnapshot();
+      }
+
+      if (state == BluetoothConnectionState.connected) {
+        await _setupConnectedDevice(id, device);
+      }
+    });
+
+    if (device.isConnected || _settingUpIds.contains(id)) {
+      return;
+    }
+
+    try {
+      await device.connect(autoConnect: true, mtu: null);
+    } catch (_) {
+      // Ignore auto-connect races; plugin retries when the peripheral is seen.
+      final current = _devices[id];
+      if (current != null) {
+        _devices[id] = current.copyWith(isConnecting: false);
+        _broadcastSnapshot();
+      }
+    }
+  }
+
+  Future<void> _setupConnectedDevice(String id, BluetoothDevice device) async {
+    if (_settingUpIds.contains(id)) {
+      return;
+    }
+    _settingUpIds.add(id);
+
+    try {
+      final services = await device.discoverServices();
+      final characteristic = _findReadingCharacteristic(services);
+      if (characteristic == null) {
+        final current = _devices[id];
+        if (current != null) {
+          _devices[id] = current.copyWith(
+            error: 'Plantie reading characteristic not found.',
+            isConnecting: false,
+          );
+          _broadcastSnapshot();
+        }
+        return;
+      }
+
+      await characteristic.setNotifyValue(true);
+      await _valueSubscriptions.remove(id)?.cancel();
+      _valueSubscriptions[id] = characteristic.onValueReceived.listen((value) {
+        if (value.length < 2) {
+          return;
+        }
+        final reading = value[0] | (value[1] << 8);
+        _handleReading(id, reading);
+      });
+
+      final latestValue = await characteristic.read();
+      if (latestValue.length >= 2) {
+        final reading = latestValue[0] | (latestValue[1] << 8);
+        await _handleReading(id, reading);
+      }
+    } finally {
+      _settingUpIds.remove(id);
+    }
+  }
+
+  BluetoothCharacteristic? _findReadingCharacteristic(
+    List<BluetoothService> services,
+  ) {
+    for (final service in services) {
+      if (service.uuid != plantieServiceUuid) {
+        continue;
+      }
+      for (final characteristic in service.characteristics) {
+        if (characteristic.uuid == plantieReadingCharacteristicUuid) {
+          return characteristic;
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<void> _handleReading(String id, int rawReading) async {
+    final current = _devices[id];
+    if (current == null) {
+      return;
+    }
+
+    var next = current.copyWith(
+      lastReading: rawReading,
+      moistureValue: mapRawReadingToMoisture(rawReading),
+      lastUpdated: DateTime.now(),
+      isConnected: true,
+      isConnecting: false,
+      error: null,
+    );
+
+    next = await _evaluateAlerts(next);
+    _devices[id] = next;
+    await saveStoredDevices(_devices);
+    await _refreshForegroundNotification();
+    _broadcastSnapshot();
+  }
+
+  Future<PlantieDeviceState> _evaluateAlerts(PlantieDeviceState device) async {
+    if (device.moistureValue == null) {
+      return device;
+    }
+
+    var next = device;
+    final moisture = device.moistureValue!;
+    final now = DateTime.now();
+    final snoozeExpired =
+        next.snoozedUntil != null && !next.snoozedUntil!.isAfter(now);
+
+    if (snoozeExpired) {
+      next = next.copyWith(snoozedUntil: null);
+    }
+
+    if (moisture > next.wetThreshold + 5) {
+      next = next.copyWith(hasCrossedWetReset: true);
+    }
+
+    if (moisture > next.dryThreshold) {
+      if (!next.thirstDismissed &&
+          next.snoozedUntil == null &&
+          !next.thirstAlertActive) {
+        next = next.copyWith(
+          thirstAlertActive: true,
+          hasTriggeredDryAlert: true,
+        );
+        await _showThirstyNotification(next);
+      }
+    } else if (moisture <= next.wetThreshold && next.hasCrossedWetReset) {
+      if (next.hasTriggeredDryAlert || next.moistureValue != null) {
+        await _showThanksNotification(next);
+      }
+      await _notifications.cancel(_thirstNotificationIdFor(next.id));
+      next = next.copyWith(
+        thirstAlertActive: false,
+        thirstDismissed: false,
+        snoozedUntil: null,
+        hasCrossedWetReset: false,
+        hasTriggeredDryAlert: false,
+      );
+    }
+
+    return next;
+  }
+
+  void _broadcastSnapshot() {
+    service.invoke('device-sync', <String, dynamic>{
+      'devices': _devices.values
+          .map((device) => device.toServiceState())
+          .toList(),
+    });
+  }
+
+  Future<void> _showThirstyNotification(PlantieDeviceState device) async {
+    final androidDetails = AndroidNotificationDetails(
+      alertChannelId,
+      alertChannelName,
+      channelDescription:
+          'Watering reminders and recovery messages for Plantie sensors',
+      importance: Importance.high,
+      priority: Priority.high,
+      actions: const <AndroidNotificationAction>[
+        AndroidNotificationAction(
+          alertSnoozeActionId,
+          'Remind in 1 minute',
+          cancelNotification: true,
+        ),
+        AndroidNotificationAction(
+          alertDismissActionId,
+          'Dismiss',
+          cancelNotification: true,
+        ),
+      ],
+    );
+
+    await _notifications.show(
+      _thirstNotificationIdFor(device.id),
+      device.displayName,
+      'I am thirsty',
+      NotificationDetails(android: androidDetails),
+      payload: device.id,
+    );
+  }
+
+  Future<void> _showThanksNotification(PlantieDeviceState device) async {
+    const androidDetails = AndroidNotificationDetails(
+      alertChannelId,
+      alertChannelName,
+      channelDescription:
+          'Watering reminders and recovery messages for Plantie sensors',
+      importance: Importance.high,
+      priority: Priority.high,
+    );
+
+    await _notifications.show(
+      _thanksNotificationIdFor(device.id),
+      device.displayName,
+      'Thanks',
+      const NotificationDetails(android: androidDetails),
+      payload: device.id,
+    );
+  }
+
+  Future<void> _refreshForegroundNotification() async {
+    if (service is! AndroidServiceInstance) {
+      return;
+    }
+    final active = _devices.length;
+    final connected = _btDevices.values
+        .where((device) => device.isConnected)
+        .length;
+    await (service as AndroidServiceInstance).setForegroundNotificationInfo(
+      title: 'Plantie monitoring',
+      content: '$connected connected, $active saved device(s)',
+    );
+  }
+}
+
+int _thirstNotificationIdFor(String id) => id.hashCode & 0x7fffffff;
+int _thanksNotificationIdFor(String id) =>
+    (id.hashCode & 0x7fffffff) ^ 0x2fffffff;
 
 class PlantieApp extends StatelessWidget {
   const PlantieApp({super.key});
@@ -59,14 +534,12 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   final Map<String, PlantieDeviceState> _savedDevices = {};
   final Map<String, ScanResult> _scanResults = {};
   final Map<String, ScanResult> _rawScanResults = {};
-  final Map<String, StreamSubscription<List<int>>> _valueSubscriptions = {};
-  final Map<String, StreamSubscription<BluetoothConnectionState>>
-  _connectionSubscriptions = {};
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
 
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<bool>? _isScanningSubscription;
+  StreamSubscription<Map<String, dynamic>?>? _serviceStateSubscription;
 
   bool _isScanning = false;
   bool _permissionsGranted = false;
@@ -83,6 +556,8 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     await _loadSavedDevices();
     await _ensurePermissions();
     _listenToScanState();
+    _listenToServiceState();
+    await _startBackgroundServiceIfNeeded();
   }
 
   Future<void> _initializeNotifications() async {
@@ -130,40 +605,22 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   }
 
   Future<void> _loadSavedDevices() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedIds = prefs.getStringList(pairedDevicesKey) ?? <String>[];
-    final rawConfig = prefs.getString(deviceConfigsKey);
-    final decodedConfig = rawConfig == null
-        ? <String, dynamic>{}
-        : jsonDecode(rawConfig) as Map<String, dynamic>;
+    final storedDevices = await loadStoredDevices();
 
     if (!mounted) {
       return;
     }
 
     setState(() {
-      for (final id in savedIds) {
-        final config = decodedConfig[id];
-        _savedDevices[id] = PlantieDeviceState.fromStorage(
-          id,
-          config is Map<String, dynamic> ? config : <String, dynamic>{},
-        );
-      }
+      _savedDevices
+        ..clear()
+        ..addAll(storedDevices);
     });
   }
 
   Future<void> _persistSavedDevices() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(
-      pairedDevicesKey,
-      _savedDevices.keys.toList()..sort(),
-    );
-
-    final configs = <String, Map<String, dynamic>>{};
-    for (final entry in _savedDevices.entries) {
-      configs[entry.key] = entry.value.toStorage();
-    }
-    await prefs.setString(deviceConfigsKey, jsonEncode(configs));
+    await saveStoredDevices(_savedDevices);
+    await _startBackgroundServiceIfNeeded();
   }
 
   Future<void> _ensurePermissions() async {
@@ -253,6 +710,45 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     });
   }
 
+  void _listenToServiceState() {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      _serviceStateSubscription ??= FlutterBackgroundService()
+          .on('device-sync')
+          .listen((event) {
+            if (!mounted || event == null) {
+              return;
+            }
+
+            final rawDevices = event['devices'];
+            if (rawDevices is! List) {
+              return;
+            }
+
+            setState(() {
+              for (final item in rawDevices) {
+                if (item is! Map) {
+                  continue;
+                }
+
+                final id = item['id'] as String?;
+                if (id == null || !_savedDevices.containsKey(id)) {
+                  continue;
+                }
+
+                final current = _savedDevices[id]!;
+                _savedDevices[id] = current.mergeServiceState(item);
+              }
+            });
+          });
+    } catch (_) {
+      // Ignore plugin absence in tests or unsupported environments.
+    }
+  }
+
   Future<void> _startScan() async {
     if (!_permissionsGranted) {
       await _ensurePermissions();
@@ -283,6 +779,28 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     });
 
     await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
+  }
+
+  Future<void> _startBackgroundServiceIfNeeded() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      final service = FlutterBackgroundService();
+      if (_savedDevices.isEmpty) {
+        service.invoke('stopService');
+        return;
+      }
+
+      final isRunning = await service.isRunning();
+      if (!isRunning) {
+        await service.startService();
+      }
+      service.invoke('refresh-config');
+    } catch (_) {
+      // Ignore plugin absence in tests or unsupported environments.
+    }
   }
 
   bool _isPlantieResult(ScanResult result) {
@@ -326,229 +844,12 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   }
 
   Future<void> _removeSaved(String id) async {
-    await _disconnect(id);
     await _cancelDeviceNotification(id);
     _savedDevices.remove(id);
     await _persistSavedDevices();
     if (mounted) {
       setState(() {});
     }
-  }
-
-  Future<void> _connect(String id) async {
-    final saved = _savedDevices[id];
-    final device = saved?.device ?? _scanResults[id]?.device;
-    if (device == null) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _statusMessage = 'Device $id is not currently discoverable.';
-      });
-      return;
-    }
-
-    setState(() {
-      _savedDevices[id] = (saved ?? PlantieDeviceState(id: id)).copyWith(
-        device: device,
-        name: _displayName(device),
-        isConnecting: true,
-        error: null,
-      );
-    });
-
-    try {
-      await device.connect(timeout: const Duration(seconds: 10));
-    } catch (error) {
-      final message = error.toString().toLowerCase();
-      if (!(message.contains('already') && message.contains('connected'))) {
-        _setDeviceError(id, error.toString());
-        return;
-      }
-    }
-
-    _connectionSubscriptions[id]?.cancel();
-    _connectionSubscriptions[id] = device.connectionState.listen((state) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        final current = _savedDevices[id];
-        if (current == null) {
-          return;
-        }
-
-        _savedDevices[id] = current.copyWith(
-          isConnected: state == BluetoothConnectionState.connected,
-          isConnecting: false,
-          device: device,
-          name: _displayName(device),
-          error: state == BluetoothConnectionState.disconnected
-              ? null
-              : current.error,
-        );
-      });
-    });
-
-    try {
-      final services = await device.discoverServices();
-      final characteristic = _findReadingCharacteristic(services);
-      if (characteristic == null) {
-        _setDeviceError(id, 'Plantie reading characteristic not found.');
-        return;
-      }
-
-      await characteristic.setNotifyValue(true);
-      _valueSubscriptions[id]?.cancel();
-      _valueSubscriptions[id] = characteristic.onValueReceived.listen((value) {
-        if (!mounted || value.length < 2) {
-          return;
-        }
-
-        final reading = value[0] | (value[1] << 8);
-        _applyIncomingReading(id, reading);
-      });
-
-      final latestValue = await characteristic.read();
-      if (latestValue.length >= 2) {
-        final reading = latestValue[0] | (latestValue[1] << 8);
-        await _applyIncomingReading(id, reading);
-      }
-    } catch (error) {
-      _setDeviceError(id, error.toString());
-    }
-  }
-
-  Future<void> _applyIncomingReading(String id, int rawReading) async {
-    final current = _savedDevices[id];
-    if (current == null) {
-      return;
-    }
-
-    final moistureValue = ((rawReading / 4095) * 100).round().clamp(0, 100);
-    final updated = current.copyWith(
-      lastReading: rawReading,
-      moistureValue: moistureValue,
-      lastUpdated: DateTime.now(),
-      isConnected: true,
-      isConnecting: false,
-      error: null,
-    );
-
-    if (mounted) {
-      setState(() {
-        _savedDevices[id] = updated;
-      });
-    }
-
-    await _evaluateAlerts(updated);
-  }
-
-  Future<void> _evaluateAlerts(PlantieDeviceState device) async {
-    if (device.moistureValue == null) {
-      return;
-    }
-
-    var next = device;
-    final moisture = device.moistureValue!;
-    final now = DateTime.now();
-    final snoozeExpired =
-        next.snoozedUntil != null && !next.snoozedUntil!.isAfter(now);
-
-    if (snoozeExpired) {
-      next = next.copyWith(snoozedUntil: null);
-    }
-
-    if (moisture > next.wetThreshold + 5) {
-      next = next.copyWith(hasCrossedWetReset: true);
-    }
-
-    if (moisture > next.dryThreshold) {
-      if (!next.thirstDismissed &&
-          next.snoozedUntil == null &&
-          !next.thirstAlertActive) {
-        next = next.copyWith(
-          thirstAlertActive: true,
-          hasTriggeredDryAlert: true,
-        );
-        await _showThirstyNotification(next);
-      }
-    } else if (moisture <= next.wetThreshold && next.hasCrossedWetReset) {
-      if (next.hasTriggeredDryAlert || next.moistureValue != null) {
-        await _showThanksNotification(next);
-      }
-      await _cancelThirstNotification(next.id);
-      next = next.copyWith(
-        thirstAlertActive: false,
-        thirstDismissed: false,
-        snoozedUntil: null,
-        hasCrossedWetReset: false,
-        hasTriggeredDryAlert: false,
-      );
-    }
-
-    if (_savedDevices[next.id] != next) {
-      if (mounted) {
-        setState(() {
-          _savedDevices[next.id] = next;
-        });
-      } else {
-        _savedDevices[next.id] = next;
-      }
-      await _persistSavedDevices();
-    }
-  }
-
-  Future<void> _showThirstyNotification(PlantieDeviceState device) async {
-    final androidDetails = AndroidNotificationDetails(
-      alertChannelId,
-      alertChannelName,
-      channelDescription:
-          'Watering reminders and recovery messages for Plantie sensors',
-      importance: Importance.high,
-      priority: Priority.high,
-      actions: const <AndroidNotificationAction>[
-        AndroidNotificationAction(
-          alertSnoozeActionId,
-          'Remind in 1 minute',
-          cancelNotification: true,
-        ),
-        AndroidNotificationAction(
-          alertDismissActionId,
-          'Dismiss',
-          cancelNotification: true,
-        ),
-      ],
-    );
-
-    await _notifications.show(
-      _thirstNotificationIdFor(device.id),
-      device.displayName,
-      'I am thirsty',
-      NotificationDetails(android: androidDetails),
-      payload: device.id,
-    );
-  }
-
-  Future<void> _showThanksNotification(PlantieDeviceState device) async {
-    const androidDetails = AndroidNotificationDetails(
-      alertChannelId,
-      alertChannelName,
-      channelDescription:
-          'Watering reminders and recovery messages for Plantie sensors',
-      importance: Importance.high,
-      priority: Priority.high,
-    );
-
-    await _notifications.show(
-      _thanksNotificationIdFor(device.id),
-      device.displayName,
-      'Thanks',
-      const NotificationDetails(android: androidDetails),
-      payload: device.id,
-    );
   }
 
   Future<void> _cancelDeviceNotification(String id) async {
@@ -643,73 +944,6 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
       _savedDevices[id] = updated;
     });
     await _persistSavedDevices();
-    await _evaluateAlerts(updated);
-  }
-
-  Future<void> _disconnect(String id) async {
-    await _valueSubscriptions.remove(id)?.cancel();
-    await _connectionSubscriptions.remove(id)?.cancel();
-
-    final device = _savedDevices[id]?.device;
-    if (device != null) {
-      try {
-        await device.disconnect();
-      } catch (_) {
-        // Ignore disconnect races when the peripheral has already gone away.
-      }
-    }
-
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      final current = _savedDevices[id];
-      if (current == null) {
-        return;
-      }
-
-      _savedDevices[id] = current.copyWith(
-        isConnected: false,
-        isConnecting: false,
-      );
-    });
-  }
-
-  BluetoothCharacteristic? _findReadingCharacteristic(
-    List<BluetoothService> services,
-  ) {
-    for (final service in services) {
-      if (service.uuid != plantieServiceUuid) {
-        continue;
-      }
-
-      for (final characteristic in service.characteristics) {
-        if (characteristic.uuid == plantieReadingCharacteristicUuid) {
-          return characteristic;
-        }
-      }
-    }
-    return null;
-  }
-
-  void _setDeviceError(String id, String message) {
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      final current = _savedDevices[id];
-      if (current == null) {
-        return;
-      }
-
-      _savedDevices[id] = current.copyWith(
-        isConnecting: false,
-        isConnected: false,
-        error: message,
-      );
-    });
   }
 
   String _displayName(BluetoothDevice device) {
@@ -738,12 +972,7 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   void dispose() {
     _scanSubscription?.cancel();
     _isScanningSubscription?.cancel();
-    for (final subscription in _valueSubscriptions.values) {
-      subscription.cancel();
-    }
-    for (final subscription in _connectionSubscriptions.values) {
-      subscription.cancel();
-    }
+    _serviceStateSubscription?.cancel();
     super.dispose();
   }
 
@@ -783,8 +1012,6 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
           for (final device in savedDevices)
             _SavedDeviceCard(
               device: device,
-              onConnect: () => _connect(device.id),
-              onDisconnect: () => _disconnect(device.id),
               onRemove: () => _removeSaved(device.id),
               onEditSettings: () => _editDeviceSettings(device.id),
               onSnooze: () => _snoozeAlert(device.id),
@@ -805,12 +1032,7 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
               result: result,
               isSaved: _savedDevices.containsKey(result.device.remoteId.str),
               onToggleSaved: () => _toggleSaved(result.device),
-              onConnect: () async {
-                if (!_savedDevices.containsKey(result.device.remoteId.str)) {
-                  await _toggleSaved(result.device);
-                }
-                await _connect(result.device.remoteId.str);
-              },
+              onConnect: () => _toggleSaved(result.device),
             ),
           const SizedBox(height: 24),
           Text(
@@ -933,6 +1155,61 @@ class PlantieDeviceState {
     };
   }
 
+  Map<String, dynamic> toServiceState() {
+    return <String, dynamic>{
+      'id': id,
+      'name': name,
+      'alias': alias,
+      'isNearby': isNearby,
+      'isConnecting': isConnecting,
+      'isConnected': isConnected,
+      'lastReading': lastReading,
+      'moistureValue': moistureValue,
+      'lastUpdatedMs': lastUpdated?.millisecondsSinceEpoch,
+      'error': error,
+      'rssi': rssi,
+      'wetThreshold': wetThreshold,
+      'dryThreshold': dryThreshold,
+      'thirstAlertActive': thirstAlertActive,
+      'thirstDismissed': thirstDismissed,
+      'hasCrossedWetReset': hasCrossedWetReset,
+      'hasTriggeredDryAlert': hasTriggeredDryAlert,
+      'snoozedUntilMs': snoozedUntil?.millisecondsSinceEpoch,
+    };
+  }
+
+  PlantieDeviceState mergeServiceState(Map<dynamic, dynamic> map) {
+    return copyWith(
+      name: map['name'] as String?,
+      alias: map['alias'] as String?,
+      isNearby: map['isNearby'] as bool? ?? isNearby,
+      isConnecting: map['isConnecting'] as bool? ?? isConnecting,
+      isConnected: map['isConnected'] as bool? ?? isConnected,
+      lastReading: (map['lastReading'] as num?)?.toInt() ?? lastReading,
+      moistureValue: (map['moistureValue'] as num?)?.toInt() ?? moistureValue,
+      lastUpdated: map['lastUpdatedMs'] == null
+          ? lastUpdated
+          : DateTime.fromMillisecondsSinceEpoch(
+              (map['lastUpdatedMs'] as num).toInt(),
+            ),
+      error: map.containsKey('error') ? map['error'] as String? : error,
+      rssi: (map['rssi'] as num?)?.toInt() ?? rssi,
+      wetThreshold: (map['wetThreshold'] as num?)?.toInt() ?? wetThreshold,
+      dryThreshold: (map['dryThreshold'] as num?)?.toInt() ?? dryThreshold,
+      thirstAlertActive: map['thirstAlertActive'] as bool? ?? thirstAlertActive,
+      thirstDismissed: map['thirstDismissed'] as bool? ?? thirstDismissed,
+      hasCrossedWetReset:
+          map['hasCrossedWetReset'] as bool? ?? hasCrossedWetReset,
+      hasTriggeredDryAlert:
+          map['hasTriggeredDryAlert'] as bool? ?? hasTriggeredDryAlert,
+      snoozedUntil: map['snoozedUntilMs'] == null
+          ? snoozedUntil
+          : DateTime.fromMillisecondsSinceEpoch(
+              (map['snoozedUntilMs'] as num).toInt(),
+            ),
+    );
+  }
+
   PlantieDeviceState copyWith({
     Object? name = _unset,
     Object? alias = _unset,
@@ -1030,8 +1307,6 @@ class _HeaderCard extends StatelessWidget {
 class _SavedDeviceCard extends StatelessWidget {
   const _SavedDeviceCard({
     required this.device,
-    required this.onConnect,
-    required this.onDisconnect,
     required this.onRemove,
     required this.onEditSettings,
     required this.onSnooze,
@@ -1039,8 +1314,6 @@ class _SavedDeviceCard extends StatelessWidget {
   });
 
   final PlantieDeviceState device;
-  final VoidCallback onConnect;
-  final VoidCallback onDisconnect;
   final VoidCallback onRemove;
   final VoidCallback onEditSettings;
   final VoidCallback onSnooze;
@@ -1117,18 +1390,14 @@ class _SavedDeviceCard extends StatelessWidget {
               spacing: 8,
               runSpacing: 8,
               children: [
-                FilledButton(
-                  onPressed: device.device == null || device.isConnecting
-                      ? null
-                      : device.isConnected
-                      ? onDisconnect
-                      : onConnect,
+                FilledButton.tonal(
+                  onPressed: null,
                   child: Text(
                     device.isConnecting
-                        ? 'Connecting...'
+                        ? 'Connecting automatically...'
                         : device.isConnected
-                        ? 'Disconnect'
-                        : 'Connect',
+                        ? 'Connected automatically'
+                        : 'Waiting to reconnect',
                   ),
                 ),
                 OutlinedButton(
@@ -1198,7 +1467,7 @@ class _DiscoveryCard extends StatelessWidget {
               onPressed: onToggleSaved,
               child: Text(isSaved ? 'Saved' : 'Save'),
             ),
-            FilledButton(onPressed: onConnect, child: const Text('Connect')),
+            FilledButton(onPressed: onConnect, child: const Text('Pair')),
           ],
         ),
       ),
