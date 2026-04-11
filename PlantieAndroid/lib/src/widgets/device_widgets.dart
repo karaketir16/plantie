@@ -3,6 +3,21 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../models/plantie_device_state.dart';
 
+String _formatTimeAgo(DateTime dt) {
+  final diff = DateTime.now().difference(dt);
+  if (diff.inSeconds < 60) return '${diff.inSeconds} s ago';
+  if (diff.inMinutes < 60) return '${diff.inMinutes} min ago';
+  if (diff.inHours < 24) return '${diff.inHours} h ago';
+  return '${diff.inDays} d ago';
+}
+
+String _formatTime(DateTime dt) {
+  final h = dt.hour.toString().padLeft(2, '0');
+  final m = dt.minute.toString().padLeft(2, '0');
+  final s = dt.second.toString().padLeft(2, '0');
+  return '$h:$m:$s';
+}
+
 class HeaderCard extends StatelessWidget {
   const HeaderCard({
     super.key,
@@ -121,11 +136,11 @@ class SavedDeviceCard extends StatelessWidget {
             ),
             if (device.lastUpdated != null) ...[
               const SizedBox(height: 8),
-              Text('Last update: ${device.lastUpdated}'),
+              Text('Last update: ${_formatTimeAgo(device.lastUpdated!)}'),
             ],
             if (device.snoozedUntil != null) ...[
               const SizedBox(height: 8),
-              Text('Reminder muted until ${device.snoozedUntil}'),
+              Text('Reminder muted until ${_formatTime(device.snoozedUntil!)}'),
             ],
             if (device.error != null) ...[
               const SizedBox(height: 8),
@@ -157,7 +172,7 @@ class SavedDeviceCard extends StatelessWidget {
                 children: [
                   FilledButton.tonal(
                     onPressed: onSnooze,
-                    child: const Text('Remind in 1 minute'),
+                    child: const Text('Remind in 30 sec'),
                   ),
                   FilledButton.tonal(
                     onPressed: onDismissAlert,

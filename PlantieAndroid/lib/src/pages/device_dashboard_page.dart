@@ -12,6 +12,7 @@ import '../constants.dart';
 import '../models/plantie_device_state.dart';
 import '../services/plantie_notifications.dart';
 import '../services/plantie_storage.dart';
+import '../services/background_monitoring.dart';
 import '../widgets/device_widgets.dart';
 
 class DeviceDashboardPage extends StatefulWidget {
@@ -62,6 +63,7 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     await _notifications.initialize(
       settings,
       onDidReceiveNotificationResponse: _handleNotificationResponse,
+      onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
     );
 
     const channel = AndroidNotificationChannel(
@@ -401,9 +403,7 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     final updated = current.copyWith(
       thirstAlertActive: false,
       thirstDismissed: false,
-      snoozedUntil: DateTime.now().add(
-        const Duration(minutes: reminderDurationMinutes),
-      ),
+      snoozedUntil: DateTime.now().add(reminderDuration),
     );
 
     if (mounted) {

@@ -7,6 +7,8 @@ import '../models/plantie_device_state.dart';
 
 Future<Map<String, PlantieDeviceState>> loadStoredDevices() async {
   final prefs = await SharedPreferences.getInstance();
+  // Ensure we see writes from other isolates (e.g. notification tap handler).
+  await prefs.reload();
   final savedIds = prefs.getStringList(pairedDevicesKey) ?? <String>[];
   final rawConfig = prefs.getString(deviceConfigsKey);
   final decodedConfig = rawConfig == null

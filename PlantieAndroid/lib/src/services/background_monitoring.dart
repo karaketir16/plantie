@@ -99,9 +99,7 @@ Future<void> notificationTapBackground(NotificationResponse response) async {
     updated = current.copyWith(
       thirstAlertActive: false,
       thirstDismissed: false,
-      snoozedUntil: DateTime.now().add(
-        const Duration(minutes: reminderDurationMinutes),
-      ),
+      snoozedUntil: DateTime.now().add(reminderDuration),
     );
   } else if (response.actionId == alertDismissActionId) {
     updated = current.copyWith(
@@ -294,6 +292,15 @@ class PlantieBackgroundMonitor {
         final reading = latestValue[0] | (latestValue[1] << 8);
         await handleReading(id, reading);
       }
+    } catch (e) {
+      final current = devices[id];
+      if (current != null) {
+        devices[id] = current.copyWith(
+          error: 'Setup failed: $e',
+          isConnecting: false,
+        );
+        broadcastSnapshot();
+      }
     } finally {
       settingUpIds.remove(id);
     }
@@ -316,12 +323,17 @@ class PlantieBackgroundMonitor {
   }
 
   Future<void> handleReading(String id, int rawReading) async {
-    final current = devices[id];
-    if (current == null) {
+    // Read the latest persisted state FIRST so we pick up any snooze/dismiss
+    // actions the UI (or notification handler) wrote to SharedPreferences since
+    // our last read.  Without this, the stale in-memory state would overwrite
+    // the user's action.
+    final latestStored = await loadStoredDevices();
+    final base = latestStored[id] ?? devices[id];
+    if (base == null) {
       return;
     }
 
-    var next = current.copyWith(
+    var next = base.copyWith(
       lastReading: rawReading,
       moistureValue: mapRawReadingToMoisture(rawReading),
       lastUpdated: DateTime.now(),
@@ -331,73 +343,13 @@ class PlantieBackgroundMonitor {
     );
 
     next = await evaluateAlerts(next);
-    devices[id] = await _mergeRuntimeDeviceState(next);
-    await _persistDevicesPreservingConfig();
+
+    // Update in-memory map and persist in one step.
+    devices[id] = next;
+    latestStored[id] = next;
+    await saveStoredDevices(latestStored);
     await refreshForegroundNotification();
     broadcastSnapshot();
-  }
-
-  Future<PlantieDeviceState> _mergeRuntimeDeviceState(
-    PlantieDeviceState runtime,
-  ) async {
-    final latestStored = await loadStoredDevices();
-    final persisted = latestStored[runtime.id];
-    if (persisted == null) {
-      return runtime;
-    }
-
-    return persisted.copyWith(
-      name: runtime.name ?? persisted.name,
-      device: runtime.device,
-      isNearby: runtime.isNearby,
-      isConnecting: runtime.isConnecting,
-      isConnected: runtime.isConnected,
-      lastReading: runtime.lastReading,
-      moistureValue: runtime.moistureValue,
-      lastUpdated: runtime.lastUpdated,
-      error: runtime.error,
-      rssi: runtime.rssi,
-      thirstAlertActive: runtime.thirstAlertActive,
-      thirstDismissed: runtime.thirstDismissed,
-      hasCrossedWetReset: runtime.hasCrossedWetReset,
-      hasCrossedDryReset: runtime.hasCrossedDryReset,
-      hasTriggeredDryAlert: runtime.hasTriggeredDryAlert,
-      snoozedUntil: runtime.snoozedUntil,
-    );
-  }
-
-  Future<void> _persistDevicesPreservingConfig() async {
-    final latestStored = await loadStoredDevices();
-    final merged = <String, PlantieDeviceState>{...latestStored};
-
-    for (final entry in devices.entries) {
-      final persisted = latestStored[entry.key];
-      merged[entry.key] = persisted == null
-          ? entry.value
-          : persisted.copyWith(
-              name: entry.value.name ?? persisted.name,
-              device: entry.value.device,
-              isNearby: entry.value.isNearby,
-              isConnecting: entry.value.isConnecting,
-              isConnected: entry.value.isConnected,
-              lastReading: entry.value.lastReading,
-              moistureValue: entry.value.moistureValue,
-              lastUpdated: entry.value.lastUpdated,
-              error: entry.value.error,
-              rssi: entry.value.rssi,
-              thirstAlertActive: entry.value.thirstAlertActive,
-              thirstDismissed: entry.value.thirstDismissed,
-              hasCrossedWetReset: entry.value.hasCrossedWetReset,
-              hasCrossedDryReset: entry.value.hasCrossedDryReset,
-              hasTriggeredDryAlert: entry.value.hasTriggeredDryAlert,
-              snoozedUntil: entry.value.snoozedUntil,
-            );
-    }
-
-    devices
-      ..clear()
-      ..addAll(merged);
-    await saveStoredDevices(merged);
   }
 
   Future<PlantieDeviceState> evaluateAlerts(PlantieDeviceState device) async {
@@ -450,7 +402,7 @@ class PlantieBackgroundMonitor {
         await showThirstyNotification(next);
       }
     } else if (moisture <= next.wetThreshold && next.hasCrossedWetReset) {
-      if (next.hasTriggeredDryAlert || next.moistureValue != null) {
+      if (next.hasTriggeredDryAlert) {
         await showThanksNotification(next);
       }
       await notifications.cancel(thirstNotificationIdFor(next.id));
@@ -494,7 +446,7 @@ class PlantieBackgroundMonitor {
       actions: const <AndroidNotificationAction>[
         AndroidNotificationAction(
           alertSnoozeActionId,
-          'Remind in 1 minute',
+          'Remind in 30 sec',
           cancelNotification: true,
         ),
         AndroidNotificationAction(
