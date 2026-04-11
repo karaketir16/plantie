@@ -45,8 +45,8 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   }
 
   Future<void> _bootstrap() async {
-    await _initializeNotifications();
     await _loadSavedDevices();
+    await _initializeNotifications();
     await _ensurePermissions();
     _listenToScanState();
     _listenToServiceState();
@@ -84,6 +84,11 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   Future<void> _handleNotificationResponse(
     NotificationResponse response,
   ) async {
+    // Ensure devices are loaded (handles cold start from notification tap).
+    if (_savedDevices.isEmpty) {
+      await _loadSavedDevices();
+    }
+
     final deviceId = resolveNotificationDeviceId(
       _savedDevices,
       payload: response.payload,

@@ -448,11 +448,13 @@ class PlantieBackgroundMonitor {
           alertSnoozeActionId,
           'Remind in 30 sec',
           cancelNotification: true,
+          showsUserInterface: true,
         ),
         AndroidNotificationAction(
           alertDismissActionId,
           'Dismiss',
           cancelNotification: true,
+          showsUserInterface: true,
         ),
       ],
     );
