@@ -16,5 +16,4 @@ const String monitorChannelName = 'Plantie Monitor';
 const Object unset = Object();
 const Duration reminderDuration = Duration(seconds: 30);
 const int foregroundServiceNotificationId = 7001;
-const Duration backgroundRefreshInterval = Duration(seconds: 5);
 const Duration connectedGracePeriod = Duration(seconds: 15);

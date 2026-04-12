@@ -25,7 +25,6 @@ class DeviceDashboardPage extends StatefulWidget {
 class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
   final Map<String, PlantieDeviceState> _savedDevices = {};
   final Map<String, ScanResult> _scanResults = {};
-  final Map<String, ScanResult> _rawScanResults = {};
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
 
@@ -208,8 +207,6 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
 
       setState(() {
         for (final result in results) {
-          _rawScanResults[result.device.remoteId.str] = result;
-
           if (!_isPlantieResult(result)) {
             continue;
           }
@@ -314,7 +311,6 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     setState(() {
       _statusMessage = 'Scanning for Plantie sensors...';
       _scanResults.clear();
-      _rawScanResults.clear();
       for (final device in _savedDevices.values) {
         _savedDevices[device.id] = device.copyWith(isNearby: false, rssi: null);
       }
@@ -489,19 +485,7 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     return 'Plantie ${device.remoteId.str.substring(0, 4)}';
   }
 
-  String _rawDisplayName(ScanResult result) {
-    final platformName = result.device.platformName.trim();
-    if (platformName.isNotEmpty) {
-      return platformName;
-    }
 
-    final advName = result.advertisementData.advName.trim();
-    if (advName.isNotEmpty) {
-      return advName;
-    }
-
-    return result.device.remoteId.str;
-  }
 
   @override
   void dispose() {
@@ -520,8 +504,6 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
       ..sort(
         (a, b) => _displayName(a.device).compareTo(_displayName(b.device)),
       );
-    final rawDevices = _rawScanResults.values.toList()
-      ..sort((a, b) => _rawDisplayName(a).compareTo(_rawDisplayName(b)));
 
     return Scaffold(
       appBar: AppBar(
@@ -568,21 +550,6 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
               result: result,
               isSaved: _savedDevices.containsKey(result.device.remoteId.str),
               onTap: () => _toggleSaved(result.device),
-            ),
-          const SizedBox(height: 24),
-          Text(
-            'Raw BLE Results',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-          const SizedBox(height: 8),
-          if (rawDevices.isEmpty)
-            const EmptyState(
-              message: 'No BLE advertisements captured in the last scan.',
-            ),
-          for (final result in rawDevices.take(15))
-            RawDiscoveryCard(
-              result: result,
-              matchesPlantie: _isPlantieResult(result),
             ),
         ],
       ),

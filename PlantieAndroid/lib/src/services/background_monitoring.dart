@@ -137,7 +137,8 @@ class PlantieBackgroundMonitor {
   connectionSubscriptions = {};
   final Map<String, StreamSubscription<List<int>>> valueSubscriptions = {};
   final Set<String> settingUpIds = <String>{};
-  Timer? refreshTimer;
+  final Map<String, Timer> inactivityTimers = {};
+  String _lastForegroundInfo = '';
 
   Future<void> start() async {
     const androidSettings = AndroidInitializationSettings(
@@ -165,22 +166,17 @@ class PlantieBackgroundMonitor {
     service.on('stopService').listen((_) async {
       await stop();
     });
-
-    refreshTimer?.cancel();
-    refreshTimer = Timer.periodic(backgroundRefreshInterval, (_) async {
-      await reloadConfigs();
-      await reconcileNotifications();
-      await refreshForegroundNotification();
-    });
   }
 
   Future<void> stop() async {
-    refreshTimer?.cancel();
     for (final sub in connectionSubscriptions.values) {
       await sub.cancel();
     }
     for (final sub in valueSubscriptions.values) {
       await sub.cancel();
+    }
+    for (final timer in inactivityTimers.values) {
+      timer.cancel();
     }
     await service.stopSelf();
   }
@@ -192,6 +188,7 @@ class PlantieBackgroundMonitor {
     for (final id in removedIds) {
       await connectionSubscriptions.remove(id)?.cancel();
       await valueSubscriptions.remove(id)?.cancel();
+      inactivityTimers.remove(id)?.cancel();
       btDevices.remove(id);
       await notifications.cancel(thirstNotificationIdFor(id));
       await notifications.cancel(thanksNotificationIdFor(id));
@@ -234,6 +231,7 @@ class PlantieBackgroundMonitor {
               : current.error,
         );
         broadcastSnapshot();
+        await refreshForegroundNotification();
       }
 
       if (state == BluetoothConnectionState.connected) {
@@ -344,14 +342,66 @@ class PlantieBackgroundMonitor {
 
     next = await evaluateAlerts(next);
 
-    // Update in-memory map and persist in one step.
+    // Check if user swiped away the notification → treat as snooze.
+    if (next.thirstAlertActive) {
+      final androidPlugin = notifications
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >();
+      if (androidPlugin != null) {
+        final active = await androidPlugin.getActiveNotifications();
+        final thirstId = thirstNotificationIdFor(id);
+        final isShowing = active.any((n) => n.id == thirstId);
+        if (!isShowing) {
+          next = next.copyWith(
+            thirstAlertActive: false,
+            thirstDismissed: false,
+            snoozedUntil: DateTime.now().add(reminderDuration),
+          );
+        }
+      }
+    }
+
+    // Update in-memory map
     devices[id] = next;
-    latestStored[id] = next;
-    await saveStoredDevices(latestStored);
-    await refreshForegroundNotification();
-    broadcastSnapshot();
+
+    // Only persist and broadcast if there are meaningful state changes
+    final stateChanged = base.moistureValue != next.moistureValue ||
+        base.isConnected != next.isConnected ||
+        base.thirstAlertActive != next.thirstAlertActive ||
+        base.thirstDismissed != next.thirstDismissed ||
+        base.snoozedUntil != next.snoozedUntil ||
+        base.error != next.error;
+
+    if (stateChanged) {
+      latestStored[id] = next;
+      await saveStoredDevices(latestStored);
+      broadcastSnapshot();
+    }
+    
+    _resetInactivityTimer(id);
   }
 
+  void _resetInactivityTimer(String id) {
+    inactivityTimers[id]?.cancel();
+    inactivityTimers[id] = Timer(const Duration(seconds: 30), () async {
+      final current = devices[id];
+      if (current != null) {
+        devices[id] = current.copyWith(isConnected: false, isConnecting: false);
+        broadcastSnapshot();
+        await refreshForegroundNotification();
+      }
+      try {
+        await btDevices[id]?.disconnect();
+      } catch (_) {}
+    });
+  }
+
+  /// Evaluates alert state on the moisture scale (0 = dry, 100 = wet).
+  ///
+  /// - moisture < [dryThreshold] → trigger thirst alert
+  /// - moisture >= [wetThreshold] → plant watered, show thanks
+  /// - moisture >= [dryThreshold] + 5 → clear stale alert state (hysteresis)
   Future<PlantieDeviceState> evaluateAlerts(PlantieDeviceState device) async {
     if (device.moistureValue == null) {
       return device;
@@ -371,11 +421,13 @@ class PlantieBackgroundMonitor {
       );
     }
 
-    if (moisture > next.wetThreshold + 5) {
+    // Wet-reset hysteresis: moisture dropped well below wet threshold.
+    if (moisture < next.wetThreshold - 5) {
       next = next.copyWith(hasCrossedWetReset: true);
     }
 
-    if (moisture <= next.dryThreshold - 5) {
+    // Recovery zone: moisture rose well above dry threshold → clear alert state.
+    if (moisture >= next.dryThreshold + 5) {
       if (next.thirstAlertActive ||
           next.thirstDismissed ||
           next.snoozedUntil != null) {
@@ -389,7 +441,8 @@ class PlantieBackgroundMonitor {
       );
     }
 
-    if (moisture > next.dryThreshold) {
+    // Below dry threshold → trigger alert.
+    if (moisture < next.dryThreshold) {
       if (!next.thirstDismissed &&
           next.snoozedUntil == null &&
           !next.thirstAlertActive &&
@@ -401,10 +454,9 @@ class PlantieBackgroundMonitor {
         );
         await showThirstyNotification(next);
       }
-    } else if (moisture <= next.wetThreshold && next.hasCrossedWetReset) {
-      if (next.hasTriggeredDryAlert) {
-        await showThanksNotification(next);
-      }
+    } else if (moisture >= next.wetThreshold && next.hasCrossedWetReset) {
+      // Above wet threshold → plant was watered.
+      await showThanksNotification(next);
       await notifications.cancel(thirstNotificationIdFor(next.id));
       next = next.copyWith(
         thirstAlertActive: false,
@@ -462,7 +514,7 @@ class PlantieBackgroundMonitor {
     await notifications.show(
       thirstNotificationIdFor(device.id),
       device.displayName,
-      'I am thirsty',
+      'I am thirsty! Moisture: ${device.moistureValue}%',
       NotificationDetails(android: androidDetails),
       payload: device.id,
     );
@@ -481,12 +533,13 @@ class PlantieBackgroundMonitor {
     await notifications.show(
       thanksNotificationIdFor(device.id),
       device.displayName,
-      'Thanks',
+      'Thanks for watering! Moisture: ${device.moistureValue}%',
       const NotificationDetails(android: androidDetails),
       payload: device.id,
     );
   }
 
+  /// Only updates the foreground service notification when the content changes.
   Future<void> refreshForegroundNotification() async {
     if (service is! AndroidServiceInstance) {
       return;
@@ -495,6 +548,11 @@ class PlantieBackgroundMonitor {
     final connected = btDevices.values
         .where((device) => device.isConnected)
         .length;
+    final info = '$connected/$active';
+    if (info == _lastForegroundInfo) {
+      return;
+    }
+    _lastForegroundInfo = info;
     await (service as AndroidServiceInstance).setForegroundNotificationInfo(
       title: 'Plantie monitoring',
       content: '$connected connected, $active saved device(s)',

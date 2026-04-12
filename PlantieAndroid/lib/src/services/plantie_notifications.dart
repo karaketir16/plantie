@@ -27,4 +27,4 @@ String? resolveNotificationDeviceId(
 }
 
 int mapRawReadingToMoisture(int rawReading) =>
-    ((rawReading / 4095) * 100).round().clamp(0, 100);
+    (100 - (rawReading / 4095) * 100).round().clamp(0, 100);

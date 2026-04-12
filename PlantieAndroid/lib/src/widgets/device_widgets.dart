@@ -5,10 +5,10 @@ import '../models/plantie_device_state.dart';
 
 String _formatTimeAgo(DateTime dt) {
   final diff = DateTime.now().difference(dt);
-  if (diff.inSeconds < 60) return '${diff.inSeconds} s ago';
-  if (diff.inMinutes < 60) return '${diff.inMinutes} min ago';
-  if (diff.inHours < 24) return '${diff.inHours} h ago';
-  return '${diff.inDays} d ago';
+  if (diff.inSeconds < 60) return '${diff.inSeconds}s ago';
+  if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+  if (diff.inHours < 24) return '${diff.inHours}h ago';
+  return '${diff.inDays}d ago';
 }
 
 String _formatTime(DateTime dt) {
@@ -17,6 +17,24 @@ String _formatTime(DateTime dt) {
   final s = dt.second.toString().padLeft(2, '0');
   return '$h:$m:$s';
 }
+
+Color _moistureColor(int moisture, int dryThreshold, int wetThreshold) {
+  if (moisture <= dryThreshold) {
+    final t = moisture / dryThreshold.clamp(1, 100);
+    return Color.lerp(const Color(0xFFD32F2F), const Color(0xFFFF9800), t)!;
+  } else if (moisture <= wetThreshold) {
+    final t = (moisture - dryThreshold) /
+        (wetThreshold - dryThreshold).clamp(1, 100);
+    return Color.lerp(const Color(0xFFFF9800), const Color(0xFF43A047), t)!;
+  } else {
+    final t = (moisture - wetThreshold) / (100 - wetThreshold).clamp(1, 100);
+    return Color.lerp(const Color(0xFF43A047), const Color(0xFF00897B), t)!;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------
 
 class HeaderCard extends StatelessWidget {
   const HeaderCard({
@@ -34,31 +52,57 @@ class HeaderCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+
     return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      color: scheme.primaryContainer.withValues(alpha: 0.35),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(20),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Multi-device BLE dashboard',
-              style: Theme.of(context).textTheme.titleMedium,
+            Row(
+              children: [
+                Icon(Icons.eco, color: scheme.primary, size: 28),
+                const SizedBox(width: 10),
+                Text(
+                  'Plantie Monitor',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w600,
+                    color: scheme.primary,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 10),
             Text(
               permissionsGranted
-                  ? 'The app can scan, save, connect, rename devices, and alert when they get dry.'
+                  ? 'Scan for nearby ESP32 sensors, save them, and get watering alerts.'
                   : 'Grant Bluetooth and notification permissions to continue.',
+              style: Theme.of(context).textTheme.bodyMedium,
             ),
             if (statusMessage != null) ...[
               const SizedBox(height: 8),
-              Text(statusMessage!),
+              Text(
+                statusMessage!,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
             ],
             const SizedBox(height: 16),
             FilledButton.icon(
               onPressed: isScanning ? null : onScanPressed,
               icon: Icon(isScanning ? Icons.radar : Icons.search),
-              label: Text(isScanning ? 'Scanning...' : 'Scan for Devices'),
+              label: Text(isScanning ? 'Scanning…' : 'Scan for Devices'),
+              style: FilledButton.styleFrom(
+                minimumSize: const Size(double.infinity, 48),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
             ),
           ],
         ),
@@ -66,6 +110,10 @@ class HeaderCard extends StatelessWidget {
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Saved-device card
+// ---------------------------------------------------------------------------
 
 class SavedDeviceCard extends StatelessWidget {
   const SavedDeviceCard({
@@ -85,108 +133,339 @@ class SavedDeviceCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final moisture = device.moistureValue;
+
     return Card(
+      elevation: 0,
       margin: const EdgeInsets.only(bottom: 12),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // ── Header row ──────────────────────────────────────────
             Row(
               children: [
+                Text('🌱', style: const TextStyle(fontSize: 22)),
+                const SizedBox(width: 8),
                 Expanded(
-                  child: Text(
-                    device.displayName,
-                    style: Theme.of(context).textTheme.titleMedium,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        device.displayName,
+                        style:
+                            Theme.of(context).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w600,
+                            ),
+                      ),
+                      Text(
+                        device.id,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
                 IconButton(
                   onPressed: onEditSettings,
-                  icon: const Icon(Icons.edit_outlined),
-                  tooltip: 'Edit alias and thresholds',
+                  icon: const Icon(Icons.settings_outlined),
+                  tooltip: 'Settings',
                 ),
               ],
             ),
-            Text(device.id),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
+
+            const SizedBox(height: 16),
+
+            // ── Moisture bar ────────────────────────────────────────
+            if (moisture != null) ...[
+              _MoistureBar(
+                moisture: moisture,
+                dryThreshold: device.dryThreshold,
+                wetThreshold: device.wetThreshold,
+              ),
+              const SizedBox(height: 12),
+            ],
+
+            // ── Status row ──────────────────────────────────────────
+            Row(
               children: [
-                Chip(
-                  label: Text(
-                    device.seemsConnected
-                        ? 'Connected'
-                        : device.isNearby
-                        ? 'Nearby'
-                        : 'Saved',
+                _StatusDot(connected: device.seemsConnected),
+                const SizedBox(width: 6),
+                Text(
+                  device.seemsConnected
+                      ? 'Connected'
+                      : device.isNearby
+                          ? 'Nearby'
+                          : 'Offline',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
-                if (device.rssi != null)
-                  Chip(label: Text('RSSI ${device.rssi}')),
-                if (device.moistureValue != null)
-                  Chip(label: Text('Dryness ${device.moistureValue}/100')),
-                Chip(
-                  label: Text(
-                    'Wet ${device.wetThreshold}  Dry ${device.dryThreshold}',
+                if (device.rssi != null) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    '· RSSI ${device.rssi}',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: scheme.onSurfaceVariant),
                   ),
-                ),
-                Chip(label: Text(device.alertLabel)),
+                ],
+                if (device.lastUpdated != null) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    '· ${_formatTimeAgo(device.lastUpdated!)}',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: scheme.onSurfaceVariant),
+                  ),
+                ],
               ],
             ),
-            if (device.lastUpdated != null) ...[
-              const SizedBox(height: 8),
-              Text('Last update: ${_formatTimeAgo(device.lastUpdated!)}'),
-            ],
-            if (device.snoozedUntil != null) ...[
-              const SizedBox(height: 8),
-              Text('Reminder muted until ${_formatTime(device.snoozedUntil!)}'),
-            ],
+
+            // ── Alert label ─────────────────────────────────────────
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Icon(
+                  device.thirstAlertActive
+                      ? Icons.warning_amber_rounded
+                      : device.snoozedUntil != null
+                          ? Icons.snooze
+                          : Icons.check_circle_outline,
+                  size: 16,
+                  color: device.thirstAlertActive
+                      ? scheme.error
+                      : scheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  device.alertLabel,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: device.thirstAlertActive
+                        ? scheme.error
+                        : scheme.onSurfaceVariant,
+                  ),
+                ),
+                if (device.snoozedUntil != null) ...[
+                  const SizedBox(width: 4),
+                  Text(
+                    '(until ${_formatTime(device.snoozedUntil!)})',
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: scheme.onSurfaceVariant),
+                  ),
+                ],
+              ],
+            ),
+
             if (device.error != null) ...[
               const SizedBox(height: 8),
               Text(
                 device.error!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
+                style: TextStyle(color: scheme.error, fontSize: 12),
               ),
             ],
+
             const SizedBox(height: 12),
+            const Divider(height: 1),
+            const SizedBox(height: 8),
+
+            // ── Action buttons ──────────────────────────────────────
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: [
-                OutlinedButton(
-                  onPressed: onEditSettings,
-                  child: const Text('Alias & Thresholds'),
-                ),
-                OutlinedButton(
-                  onPressed: onRemove,
-                  child: const Text('Remove Device'),
-                ),
-              ],
-            ),
-            if (device.showAlertActions) ...[
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
+                if (device.showAlertActions) ...[
                   FilledButton.tonal(
                     onPressed: onSnooze,
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
                     child: const Text('Remind in 30 sec'),
                   ),
                   FilledButton.tonal(
                     onPressed: onDismissAlert,
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
                     child: const Text('Dismiss alert'),
                   ),
                 ],
-              ),
-            ],
+                TextButton(
+                  onPressed: onRemove,
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    foregroundColor: scheme.error,
+                  ),
+                  child: const Text('Remove'),
+                ),
+              ],
+            ),
           ],
         ),
       ),
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Moisture bar
+// ---------------------------------------------------------------------------
+
+class _MoistureBar extends StatelessWidget {
+  const _MoistureBar({
+    required this.moisture,
+    required this.dryThreshold,
+    required this.wetThreshold,
+  });
+
+  final int moisture;
+  final int dryThreshold;
+  final int wetThreshold;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = _moistureColor(moisture, dryThreshold, wetThreshold);
+    final fraction = moisture.clamp(0, 100) / 100;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.water_drop_outlined, size: 16, color: color),
+            const SizedBox(width: 4),
+            Text(
+              'Moisture',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+            const Spacer(),
+            Text(
+              '$moisture%',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        SizedBox(
+          height: 14,
+          child: Stack(
+            children: [
+              // Background track
+              Container(
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(7),
+                ),
+              ),
+              // Filled portion
+              FractionallySizedBox(
+                widthFactor: fraction,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: color,
+                    borderRadius: BorderRadius.circular(7),
+                  ),
+                ),
+              ),
+              // Dry threshold marker
+              Positioned(
+                left: _markerPosition(context, dryThreshold),
+                top: 0,
+                bottom: 0,
+                child: Container(
+                  width: 2,
+                  color: scheme.onSurface.withValues(alpha: 0.25),
+                ),
+              ),
+              // Wet threshold marker
+              Positioned(
+                left: _markerPosition(context, wetThreshold),
+                top: 0,
+                bottom: 0,
+                child: Container(
+                  width: 2,
+                  color: scheme.onSurface.withValues(alpha: 0.25),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Text(
+              '🏜️ Dry $dryThreshold',
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+            const Spacer(),
+            Text(
+              'Wet $wetThreshold 💧',
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  double _markerPosition(BuildContext context, int threshold) {
+    // We compute fractional position. The actual pixel offset is resolved
+    // via LayoutBuilder, but for simplicity we approximate using the
+    // available width obtained from the parent constraints.
+    // Since we are inside a Column → Row → Expanded chain, we use a
+    // LayoutBuilder-free approach: the Stack fills its parent and we can
+    // use relative positioning.
+    // Return a fraction.  Positioned.left doesn't take fractions so we
+    // fall back to using Align inside the stack in a real implementation.
+    // For now this is close enough using media query.
+    final barWidth =
+        MediaQuery.of(context).size.width - 32 - 32; // padding estimates
+    return (threshold / 100) * barWidth;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status dot
+// ---------------------------------------------------------------------------
+
+class _StatusDot extends StatelessWidget {
+  const _StatusDot({required this.connected});
+  final bool connected;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 8,
+      height: 8,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: connected ? const Color(0xFF43A047) : Colors.grey,
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Discovery card
+// ---------------------------------------------------------------------------
 
 class DiscoveryCard extends StatelessWidget {
   const DiscoveryCard({
@@ -202,91 +481,45 @@ class DiscoveryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     final name = result.device.platformName.trim().isNotEmpty
         ? result.device.platformName
         : result.advertisementData.advName;
 
     return Card(
+      elevation: 0,
       margin: const EdgeInsets.only(bottom: 12),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: ListTile(
         onTap: isSaved ? null : onTap,
-        contentPadding: const EdgeInsets.all(16),
-        title: Text(name.isEmpty ? result.device.remoteId.str : name),
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        leading: CircleAvatar(
+          backgroundColor: isSaved
+              ? scheme.primaryContainer
+              : scheme.surfaceContainerHighest,
+          child: Icon(
+            isSaved ? Icons.check : Icons.add,
+            color: isSaved ? scheme.primary : scheme.onSurfaceVariant,
+          ),
+        ),
+        title: Text(
+          name.isEmpty ? result.device.remoteId.str : name,
+          style: const TextStyle(fontWeight: FontWeight.w500),
+        ),
         subtitle: Text(
-          '${result.device.remoteId.str}\nRSSI ${result.rssi}\n'
-          '${isSaved ? 'Already saved' : 'Tap to add this sensor'}',
+          '${result.device.remoteId.str}\n'
+          'RSSI ${result.rssi} · ${isSaved ? 'Already saved' : 'Tap to add'}',
         ),
         isThreeLine: true,
-        trailing: Icon(
-          isSaved ? Icons.check_circle : Icons.add_circle_outline,
-          color: isSaved
-              ? Theme.of(context).colorScheme.primary
-              : Theme.of(context).colorScheme.secondary,
-        ),
       ),
     );
   }
 }
 
-class RawDiscoveryCard extends StatelessWidget {
-  const RawDiscoveryCard({
-    super.key,
-    required this.result,
-    required this.matchesPlantie,
-  });
-
-  final ScanResult result;
-  final bool matchesPlantie;
-
-  @override
-  Widget build(BuildContext context) {
-    final platformName = result.device.platformName.trim();
-    final advName = result.advertisementData.advName.trim();
-    final title = platformName.isNotEmpty
-        ? platformName
-        : advName.isNotEmpty
-        ? advName
-        : result.device.remoteId.str;
-
-    final services = result.advertisementData.serviceUuids
-        .map((uuid) => uuid.toString())
-        .join(', ');
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 12),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(title, style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 4),
-            Text(result.device.remoteId.str),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                Chip(label: Text('RSSI ${result.rssi}')),
-                Chip(
-                  label: Text(matchesPlantie ? 'Matches Plantie' : 'Other BLE'),
-                ),
-              ],
-            ),
-            if (advName.isNotEmpty && advName != title) ...[
-              const SizedBox(height: 8),
-              Text('Adv name: $advName'),
-            ],
-            if (services.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text('Services: $services'),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
+// ---------------------------------------------------------------------------
+// Empty state placeholder
+// ---------------------------------------------------------------------------
 
 class EmptyState extends StatelessWidget {
   const EmptyState({super.key, required this.message});
@@ -296,10 +529,27 @@ class EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      child: Padding(padding: const EdgeInsets.all(16), child: Text(message)),
+      elevation: 0,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Center(
+          child: Text(
+            message,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Settings dialog
+// ---------------------------------------------------------------------------
 
 class DeviceSettingsResult {
   const DeviceSettingsResult({
@@ -330,9 +580,10 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
   void initState() {
     super.initState();
     _aliasController = TextEditingController(text: widget.device.alias ?? '');
+    // Left = dryThreshold (lower), Right = wetThreshold (higher).
     _thresholds = RangeValues(
-      widget.device.wetThreshold.toDouble(),
       widget.device.dryThreshold.toDouble(),
+      widget.device.wetThreshold.toDouble(),
     );
   }
 
@@ -343,23 +594,23 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
   }
 
   void _updateThresholds(RangeValues next) {
-    var wet = next.start.round();
-    var dry = next.end.round();
+    var dry = next.start.round();
+    var wet = next.end.round();
 
-    if (dry - wet < 10) {
-      final movedWet = wet != _thresholds.start.round();
-      if (movedWet) {
-        wet = dry - 10;
+    if (wet - dry < 10) {
+      final movedDry = dry != _thresholds.start.round();
+      if (movedDry) {
+        dry = wet - 10;
       } else {
-        dry = wet + 10;
+        wet = dry + 10;
       }
     }
 
-    wet = wet.clamp(0, 90);
-    dry = dry.clamp(wet + 10, 100);
+    dry = dry.clamp(0, 90);
+    wet = wet.clamp(dry + 10, 100);
 
     setState(() {
-      _thresholds = RangeValues(wet.toDouble(), dry.toDouble());
+      _thresholds = RangeValues(dry.toDouble(), wet.toDouble());
     });
   }
 
@@ -381,7 +632,7 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
             ),
             const SizedBox(height: 24),
             Text(
-              'Wet ${_thresholds.start.round()}    Dry ${_thresholds.end.round()}',
+              '🏜️ Dry ${_thresholds.start.round()}    💧 Wet ${_thresholds.end.round()}',
             ),
             const SizedBox(height: 8),
             RangeSlider(
@@ -389,14 +640,17 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
               max: 100,
               divisions: 100,
               labels: RangeLabels(
-                'Wet ${_thresholds.start.round()}',
-                'Dry ${_thresholds.end.round()}',
+                'Dry ${_thresholds.start.round()}',
+                'Wet ${_thresholds.end.round()}',
               ),
               values: _thresholds,
               onChanged: _updateThresholds,
             ),
             const Text(
-              'Left handle is wet, right handle is dry. The gap stays at least 10 points.',
+              'Alert when moisture drops below Dry. '
+              'Recovery when moisture rises above Wet. '
+              'Gap stays at least 10.',
+              style: TextStyle(fontSize: 12),
             ),
           ],
         ),
@@ -411,8 +665,8 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
             Navigator.of(context).pop(
               DeviceSettingsResult(
                 alias: _aliasController.text,
-                wetThreshold: _thresholds.start.round(),
-                dryThreshold: _thresholds.end.round(),
+                dryThreshold: _thresholds.start.round(),
+                wetThreshold: _thresholds.end.round(),
               ),
             );
           },

@@ -28,7 +28,7 @@ class PlantieServerCallbacks : public BLEServerCallbacks {
 
 String buildDeviceName() {
   uint64_t efuseMac = ESP.getEfuseMac();
-  uint16_t suffix = static_cast<uint16_t>(efuseMac & 0xFFFF);
+  uint16_t suffix = static_cast<uint16_t>((efuseMac >> 32) & 0xFFFF);
 
   char name[20];
   snprintf(name, sizeof(name), "Plantie-%04X", suffix);
