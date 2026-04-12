@@ -404,7 +404,7 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
     final updated = current.copyWith(
       thirstAlertActive: false,
       thirstDismissed: false,
-      snoozedUntil: DateTime.now().add(reminderDuration),
+      snoozedUntil: DateTime.now().add(Duration(minutes: current.reminderDurationMinutes)),
     );
 
     if (mounted) {
@@ -468,6 +468,8 @@ class _DeviceDashboardPageState extends State<DeviceDashboardPage> {
       hasCrossedDryReset: true,
       hasTriggeredDryAlert: false,
       snoozedUntil: null,
+      customThirstMessages: result.customThirstMessages,
+      reminderDurationMinutes: result.reminderDurationMinutes,
     );
 
     setState(() {

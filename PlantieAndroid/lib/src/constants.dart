@@ -14,6 +14,6 @@ const String alertDismissActionId = 'dismiss_alert';
 const String monitorChannelId = 'plantie_monitor';
 const String monitorChannelName = 'Plantie Monitor';
 const Object unset = Object();
-const Duration reminderDuration = Duration(seconds: 30);
+const Duration reminderDuration = Duration(minutes: 30);
 const int foregroundServiceNotificationId = 7001;
 const Duration connectedGracePeriod = Duration(seconds: 15);

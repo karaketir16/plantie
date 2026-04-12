@@ -24,6 +24,8 @@ class PlantieDeviceState {
     this.hasCrossedDryReset = true,
     this.hasTriggeredDryAlert = false,
     this.snoozedUntil,
+    this.customThirstMessages = const <String>[],
+    this.reminderDurationMinutes = 30,
   });
 
   factory PlantieDeviceState.fromStorage(String id, Map<String, dynamic> map) {
@@ -43,6 +45,8 @@ class PlantieDeviceState {
           : DateTime.fromMillisecondsSinceEpoch(
               (map['snoozedUntilMs'] as num).toInt(),
             ),
+      customThirstMessages: (map['customThirstMessages'] as List?)?.cast<String>() ?? const <String>[],
+      reminderDurationMinutes: (map['reminderDurationMinutes'] as num?)?.toInt() ?? 30,
     );
   }
 
@@ -66,6 +70,8 @@ class PlantieDeviceState {
   final bool hasCrossedDryReset;
   final bool hasTriggeredDryAlert;
   final DateTime? snoozedUntil;
+  final List<String> customThirstMessages;
+  final int reminderDurationMinutes;
 
   String get displayName {
     final trimmedAlias = alias?.trim();
@@ -116,6 +122,8 @@ class PlantieDeviceState {
       'hasCrossedDryReset': hasCrossedDryReset,
       'hasTriggeredDryAlert': hasTriggeredDryAlert,
       'snoozedUntilMs': snoozedUntil?.millisecondsSinceEpoch,
+      'customThirstMessages': customThirstMessages,
+      'reminderDurationMinutes': reminderDurationMinutes,
     };
   }
 
@@ -140,6 +148,8 @@ class PlantieDeviceState {
       'hasCrossedDryReset': hasCrossedDryReset,
       'hasTriggeredDryAlert': hasTriggeredDryAlert,
       'snoozedUntilMs': snoozedUntil?.millisecondsSinceEpoch,
+      'customThirstMessages': customThirstMessages,
+      'reminderDurationMinutes': reminderDurationMinutes,
     };
   }
 
@@ -174,6 +184,8 @@ class PlantieDeviceState {
           : DateTime.fromMillisecondsSinceEpoch(
               (map['snoozedUntilMs'] as num).toInt(),
             ),
+      customThirstMessages: (map['customThirstMessages'] as List?)?.cast<String>() ?? customThirstMessages,
+      reminderDurationMinutes: (map['reminderDurationMinutes'] as num?)?.toInt() ?? reminderDurationMinutes,
     );
   }
 
@@ -197,6 +209,8 @@ class PlantieDeviceState {
     bool? hasCrossedDryReset,
     bool? hasTriggeredDryAlert,
     Object? snoozedUntil = unset,
+    List<String>? customThirstMessages,
+    int? reminderDurationMinutes,
   }) {
     return PlantieDeviceState(
       id: id,
@@ -221,6 +235,8 @@ class PlantieDeviceState {
       snoozedUntil: identical(snoozedUntil, unset)
           ? this.snoozedUntil
           : snoozedUntil as DateTime?,
+      customThirstMessages: customThirstMessages ?? this.customThirstMessages,
+      reminderDurationMinutes: reminderDurationMinutes ?? this.reminderDurationMinutes,
     );
   }
 }

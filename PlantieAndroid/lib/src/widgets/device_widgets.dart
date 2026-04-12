@@ -288,7 +288,7 @@ class SavedDeviceCard extends StatelessWidget {
                     style: FilledButton.styleFrom(
                       visualDensity: VisualDensity.compact,
                     ),
-                    child: const Text('Remind in 30 sec'),
+                    child: Text('Remind in ${device.reminderDurationMinutes} min'),
                   ),
                   FilledButton.tonal(
                     onPressed: onDismissAlert,
@@ -556,11 +556,15 @@ class DeviceSettingsResult {
     required this.alias,
     required this.wetThreshold,
     required this.dryThreshold,
+    required this.customThirstMessages,
+    required this.reminderDurationMinutes,
   });
 
   final String alias;
   final int wetThreshold;
   final int dryThreshold;
+  final List<String> customThirstMessages;
+  final int reminderDurationMinutes;
 }
 
 class DeviceSettingsDialog extends StatefulWidget {
@@ -574,22 +578,27 @@ class DeviceSettingsDialog extends StatefulWidget {
 
 class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
   late final TextEditingController _aliasController;
+  late final TextEditingController _reminderController;
   late RangeValues _thresholds;
+  late List<String> _customThirstMessages;
 
   @override
   void initState() {
     super.initState();
     _aliasController = TextEditingController(text: widget.device.alias ?? '');
+    _reminderController = TextEditingController(text: widget.device.reminderDurationMinutes.toString());
     // Left = dryThreshold (lower), Right = wetThreshold (higher).
     _thresholds = RangeValues(
       widget.device.dryThreshold.toDouble(),
       widget.device.wetThreshold.toDouble(),
     );
+    _customThirstMessages = List.of(widget.device.customThirstMessages);
   }
 
   @override
   void dispose() {
     _aliasController.dispose();
+    _reminderController.dispose();
     super.dispose();
   }
 
@@ -630,6 +639,15 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
                 hintText: 'Kitchen basil',
               ),
             ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _reminderController,
+              decoration: const InputDecoration(
+                labelText: 'Reminder interval (minutes)',
+                hintText: '30',
+              ),
+              keyboardType: TextInputType.number,
+            ),
             const SizedBox(height: 24),
             Text(
               '🏜️ Dry ${_thresholds.start.round()}    💧 Wet ${_thresholds.end.round()}',
@@ -652,6 +670,28 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
               'Gap stays at least 10.',
               style: TextStyle(fontSize: 12),
             ),
+            const SizedBox(height: 24),
+            OutlinedButton.icon(
+              onPressed: () async {
+                final result = await showDialog<List<String>>(
+                  context: context,
+                  builder: (context) => CustomMessagesDialog(
+                    initialMessages: _customThirstMessages,
+                  ),
+                );
+                if (result != null) {
+                  setState(() {
+                    _customThirstMessages = result;
+                  });
+                }
+              },
+              icon: const Icon(Icons.forum_outlined),
+              label: Text('Custom Thirst Messages (${_customThirstMessages.length})'),
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(double.infinity, 48),
+                alignment: Alignment.centerLeft,
+              ),
+            ),
           ],
         ),
       ),
@@ -667,6 +707,8 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
                 alias: _aliasController.text,
                 dryThreshold: _thresholds.start.round(),
                 wetThreshold: _thresholds.end.round(),
+                customThirstMessages: _customThirstMessages,
+                reminderDurationMinutes: int.tryParse(_reminderController.text) ?? 30,
               ),
             );
           },
@@ -674,5 +716,123 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
         ),
       ],
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Custom messages dialog
+// ---------------------------------------------------------------------------
+
+class CustomMessagesDialog extends StatefulWidget {
+  const CustomMessagesDialog({super.key, required this.initialMessages});
+
+  final List<String> initialMessages;
+
+  @override
+  State<CustomMessagesDialog> createState() => _CustomMessagesDialogState();
+}
+
+class _CustomMessagesDialogState extends State<CustomMessagesDialog> {
+  late List<String> _messages;
+  late final TextEditingController _newMessageController;
+
+  @override
+  void initState() {
+    super.initState();
+    _messages = List.of(widget.initialMessages);
+    _newMessageController = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _newMessageController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Custom messages'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Add custom thirsty alerts. When the plant needs water, '
+              'one of these will be randomly chosen. If empty, it defaults to "I am thirsty!".',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 16),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: _messages.length,
+                itemBuilder: (context, i) {
+                  return ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(_messages[i]),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () {
+                        setState(() {
+                          _messages.removeAt(i);
+                        });
+                      },
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _newMessageController,
+                    decoration: const InputDecoration(
+                      hintText: 'e.g., Water me please!',
+                      isDense: true,
+                    ),
+                    onSubmitted: (_) => _addMessage(),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.add),
+                  onPressed: _addMessage,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final text = _newMessageController.text.trim();
+            if (text.isNotEmpty) {
+              _messages.add(text);
+            }
+            Navigator.of(context).pop(_messages);
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+
+  void _addMessage() {
+    final text = _newMessageController.text.trim();
+    if (text.isNotEmpty) {
+      setState(() {
+        _messages.add(text);
+        _newMessageController.clear();
+      });
+    }
   }
 }

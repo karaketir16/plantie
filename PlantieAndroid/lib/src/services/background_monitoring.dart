@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'dart:ui';
 
 import 'package:flutter_background_service/flutter_background_service.dart';
@@ -99,7 +100,7 @@ Future<void> notificationTapBackground(NotificationResponse response) async {
     updated = current.copyWith(
       thirstAlertActive: false,
       thirstDismissed: false,
-      snoozedUntil: DateTime.now().add(reminderDuration),
+      snoozedUntil: DateTime.now().add(Duration(minutes: current.reminderDurationMinutes)),
     );
   } else if (response.actionId == alertDismissActionId) {
     updated = current.copyWith(
@@ -356,7 +357,7 @@ class PlantieBackgroundMonitor {
           next = next.copyWith(
             thirstAlertActive: false,
             thirstDismissed: false,
-            snoozedUntil: DateTime.now().add(reminderDuration),
+            snoozedUntil: DateTime.now().add(Duration(minutes: next.reminderDurationMinutes)),
           );
         }
       }
@@ -495,10 +496,10 @@ class PlantieBackgroundMonitor {
           'Watering reminders and recovery messages for Plantie sensors',
       importance: Importance.high,
       priority: Priority.high,
-      actions: const <AndroidNotificationAction>[
+      actions: <AndroidNotificationAction>[
         AndroidNotificationAction(
           alertSnoozeActionId,
-          'Remind in 30 sec',
+          'Remind in ${device.reminderDurationMinutes} min',
           cancelNotification: true,
           showsUserInterface: true,
         ),
@@ -511,10 +512,16 @@ class PlantieBackgroundMonitor {
       ],
     );
 
+    String message = 'I am thirsty!';
+    if (device.customThirstMessages.isNotEmpty) {
+      final rand = Random();
+      message = device.customThirstMessages[rand.nextInt(device.customThirstMessages.length)];
+    }
+
     await notifications.show(
       thirstNotificationIdFor(device.id),
       device.displayName,
-      'I am thirsty! Moisture: ${device.moistureValue}%',
+      message,
       NotificationDetails(android: androidDetails),
       payload: device.id,
     );
