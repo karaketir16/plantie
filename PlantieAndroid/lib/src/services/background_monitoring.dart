@@ -237,6 +237,15 @@ class PlantieBackgroundMonitor {
 
       if (state == BluetoothConnectionState.connected) {
         await setupConnectedDevice(id, device);
+      } else if (state == BluetoothConnectionState.disconnected) {
+        settingUpIds.remove(id);
+        if (devices.containsKey(id)) {
+          Future.delayed(const Duration(seconds: 5), () {
+            if (devices.containsKey(id) && !device.isConnected) {
+              ensureConnected(id);
+            }
+          });
+        }
       }
     });
 
@@ -251,6 +260,12 @@ class PlantieBackgroundMonitor {
       if (current != null) {
         devices[id] = current.copyWith(isConnecting: false);
         broadcastSnapshot();
+        
+        Future.delayed(const Duration(seconds: 5), () {
+          if (devices.containsKey(id) && !device.isConnected) {
+            ensureConnected(id);
+          }
+        });
       }
     }
   }
