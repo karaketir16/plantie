@@ -45,7 +45,7 @@ class PlantieDeviceState {
           : DateTime.fromMillisecondsSinceEpoch(
               (map['snoozedUntilMs'] as num).toInt(),
             ),
-      customThirstMessages: (map['customThirstMessages'] as List?)?.cast<String>() ?? const <String>[],
+      customThirstMessages: (map['customThirstMessages'] as List?)?.map((e) => e.toString()).toList() ?? const <String>[],
       reminderDurationMinutes: (map['reminderDurationMinutes'] as num?)?.toInt() ?? 30,
     );
   }
@@ -184,7 +184,7 @@ class PlantieDeviceState {
           : DateTime.fromMillisecondsSinceEpoch(
               (map['snoozedUntilMs'] as num).toInt(),
             ),
-      customThirstMessages: (map['customThirstMessages'] as List?)?.cast<String>() ?? customThirstMessages,
+      customThirstMessages: (map['customThirstMessages'] as List?)?.map((e) => e.toString()).toList() ?? customThirstMessages,
       reminderDurationMinutes: (map['reminderDurationMinutes'] as num?)?.toInt() ?? reminderDurationMinutes,
     );
   }

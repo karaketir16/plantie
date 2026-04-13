@@ -673,15 +673,15 @@ class _DeviceSettingsDialogState extends State<DeviceSettingsDialog> {
             const SizedBox(height: 24),
             OutlinedButton.icon(
               onPressed: () async {
-                final result = await showDialog<List<String>>(
+                final result = await showDialog(
                   context: context,
                   builder: (context) => CustomMessagesDialog(
                     initialMessages: _customThirstMessages,
                   ),
                 );
-                if (result != null) {
+                if (result is List) {
                   setState(() {
-                    _customThirstMessages = result;
+                    _customThirstMessages = result.map((e) => e.toString()).toList();
                   });
                 }
               },
@@ -739,7 +739,7 @@ class _CustomMessagesDialogState extends State<CustomMessagesDialog> {
   @override
   void initState() {
     super.initState();
-    _messages = List.of(widget.initialMessages);
+    _messages = List<String>.from(widget.initialMessages);
     _newMessageController = TextEditingController();
   }
 

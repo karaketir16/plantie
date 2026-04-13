@@ -1,0 +1,4 @@
+-keep class com.dexterous.** { *; }
+-keep class com.google.gson.** { *; }
+-keepattributes Signature
+-keepattributes *Annotation*
